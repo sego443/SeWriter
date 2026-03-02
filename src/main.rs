@@ -8,12 +8,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static HOTKEY_FIRED: AtomicBool = AtomicBool::new(false);
 
+// Text and cursor layout constants (will be user-configurable in a future release).
+const FONT_SIZE: f32 = 16.0;
+const CURSOR_HEIGHT: f32 = FONT_SIZE + 4.0;   // slightly taller than the text glyphs
+const LINE_HEIGHT: f32 = CURSOR_HEIGHT + 8.0;  // 4 px of equal padding around the cursor
+
 #[derive(Serialize, Deserialize, Default)]
 struct AppState {
     vault_path: Option<PathBuf>,
     current_title: String,
     current_content: String,
     last_edit_date: Option<String>,
+    window_size: Option<[f32; 2]>,
 }
 
 struct SeWriterApp {
@@ -154,13 +160,27 @@ impl SeWriterApp {
     // Hide the window (keep process alive so the hotkey stays registered).
     fn hide(&mut self, ctx: &egui::Context) {
         self.auto_save();
+        self.save_state(); // always persist state (including window_size) on hide
         self.is_hidden = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 }
 
 impl eframe::App for SeWriterApp {
+    fn on_exit(&mut self) {
+        self.save_state(); // persist window_size (and anything else) on Cmd+Q
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Track window size in memory — flushed to disk in hide() and on_exit().
+        // Comparing rounded values avoids spurious writes from sub-pixel fluctuations.
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            let size = [rect.width().round(), rect.height().round()];
+            if self.state.window_size != Some(size) {
+                self.state.window_size = Some(size);
+            }
+        }
+
         // Ctrl+W: show and activate window
         if HOTKEY_FIRED.swap(false, Ordering::Relaxed) {
             self.on_activate(ctx);
@@ -240,20 +260,100 @@ impl eframe::App for SeWriterApp {
                     });
                 }
                 InputMode::EditContent => {
-                    let scroll = egui::ScrollArea::vertical()
+                    let scroll_out = egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             // Disable TextEdit while save dialog is open so that
                             // the Enter keypress confirming the dialog is not also
                             // inserted as a newline into the content.
-                            ui.add_enabled(
-                                !self.show_save_dialog,
-                                egui::TextEdit::multiline(&mut self.state.current_content)
-                                    .desired_width(f32::INFINITY)
-                                    .font(egui::TextStyle::Body),
-                            )
+                            if self.show_save_dialog {
+                                ui.disable();
+                            }
+
+                            let te_out = egui::TextEdit::multiline(&mut self.state.current_content)
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut |ui, text, wrap_width| {
+                                    let mut job = egui::text::LayoutJob::simple(
+                                        text.to_string(),
+                                        egui::FontId::proportional(FONT_SIZE),
+                                        ui.visuals().text_color(),
+                                        wrap_width,
+                                    );
+                                    for section in &mut job.sections {
+                                        section.format.line_height = Some(LINE_HEIGHT);
+                                    }
+                                    ui.fonts(|f| f.layout_job(job))
+                                })
+                                .show(ui);
+
+                            // Center text within each LINE_HEIGHT row.
+                            //
+                            // epaint always places glyphs at the row top; the extra space from
+                            // LINE_HEIGHT accumulates at the bottom. We shift the galley down by
+                            // shift_y = (LINE_HEIGHT - natural_row_h) / 2 to center the glyphs.
+                            //
+                            // Steps:
+                            //   1. Cover the inner text area with extreme_bg_color (same color
+                            //      egui uses for the TextEdit background) to erase the original
+                            //      unshifted text while leaving the frame border intact.
+                            //   2. Repaint the galley at galley_pos + shift_y. Selection
+                            //      highlights are baked into the galley mesh by TextEdit before
+                            //      returning TextEditOutput, so they shift with the text.
+                            //   3. Draw the cursor at row_rect.center().y, which equals
+                            //      shift_y + natural_row_h/2 — exactly the shifted text center.
+                            //
+                            // egui's built-in cursor is hidden via style (stroke = NONE).
+                            // shift_y centers the glyph body (height ≈ FONT_SIZE) within
+                            // each LINE_HEIGHT row. Using FONT_SIZE here, not row_height(),
+                            // because row_height() includes the line_gap which is empty space
+                            // below the glyphs — using it would under-shift by half the gap.
+                            let shift_y = (LINE_HEIGHT - FONT_SIZE) / 2.0;
+                            let rounding = ui.style().interact(&te_out.response).rounding;
+                            ui.painter().rect_filled(
+                                te_out.response.rect,
+                                rounding,
+                                ui.visuals().extreme_bg_color,
+                            );
+                            ui.painter().galley(
+                                te_out.galley_pos + egui::vec2(0.0, shift_y),
+                                te_out.galley.clone(),
+                                ui.visuals().text_color(),
+                            );
+
+                            if te_out.response.has_focus() {
+                                if let Some(ref cursor_range) = te_out.cursor_range {
+                                    let row_rect = te_out.galley
+                                        .pos_from_cursor(&cursor_range.primary);
+                                    // row_rect.center().y = row_rect.min.y + LINE_HEIGHT/2
+                                    //                     = shift_y + natural_row_h/2
+                                    //                     = center of the shifted text
+                                    let screen_pos = egui::pos2(
+                                        te_out.galley_pos.x + row_rect.min.x,
+                                        te_out.galley_pos.y + row_rect.center().y,
+                                    );
+                                    let cursor_rect = egui::Rect::from_center_size(
+                                        screen_pos,
+                                        egui::vec2(2.0, CURSOR_HEIGHT),
+                                    );
+                                    let time = ui.input(|i| i.time);
+                                    if (time % 2.0) < 1.0 {
+                                        ui.painter().rect_filled(
+                                            cursor_rect,
+                                            0.0,
+                                            ui.visuals().text_color(),
+                                        );
+                                    }
+                                    ui.ctx().request_repaint_after(
+                                        std::time::Duration::from_millis(1000),
+                                    );
+                                }
+                            }
+
+                            te_out
                         });
-                    let response = scroll.inner;
+
+                    let te_out = scroll_out.inner;
+                    let response = &te_out.response;
                     if self.request_focus && !self.show_save_dialog {
                         response.request_focus();
                         self.request_focus = false;
@@ -309,9 +409,18 @@ fn main() -> Result<(), eframe::Error> {
     let hotkey = HotKey::new(Some(Modifiers::CONTROL), Code::KeyW);
     _hotkey_manager.register(hotkey).expect("failed to register Ctrl+W");
 
+    // Read saved window size before constructing NativeOptions so the window
+    // opens at the same size the user left it. Falls back to 800×600.
+    let saved_size = dirs::config_dir()
+        .map(|p| p.join("sewriter").join("state.json"))
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<AppState>(&s).ok())
+        .and_then(|s| s.window_size)
+        .unwrap_or([800.0, 600.0]);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
+            .with_inner_size(saved_size)
             .with_min_inner_size([400.0, 300.0]),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
@@ -339,8 +448,12 @@ fn main() -> Result<(), eframe::Error> {
             }
 
             cc.egui_ctx.style_mut(|style| {
-                style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+                style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(FONT_SIZE));
                 style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
+                // Hide egui's built-in cursor; SeWriter draws its own at the correct height.
+                // blink=false prevents egui from scheduling repaints for the invisible cursor.
+                style.visuals.text_cursor.stroke = egui::Stroke::NONE;
+                style.visuals.text_cursor.blink = false;
             });
 
             // Hotkey watcher: receives GlobalHotKeyEvent and wakes the egui event loop.
