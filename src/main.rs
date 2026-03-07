@@ -13,6 +13,26 @@ const FONT_SIZE: f32 = 16.0;
 const CURSOR_HEIGHT: f32 = FONT_SIZE + 4.0;   // slightly taller than the text glyphs
 const LINE_HEIGHT: f32 = CURSOR_HEIGHT + 8.0;  // 4 px of equal padding around the cursor
 
+// Title input uses the Heading font (24 px); same padding formula as the editor.
+const TITLE_FONT_SIZE: f32 = 24.0;
+const TITLE_CURSOR_HEIGHT: f32 = TITLE_FONT_SIZE + 4.0;
+const TITLE_LINE_HEIGHT: f32 = TITLE_CURSOR_HEIGHT + 8.0;
+
+// Command palette entries, sorted alphabetically by name.
+const COMMANDS: &[(&str, &str)] = &[
+    ("/finish", "save and close, start fresh next time"),
+    ("/new",    "save current and start a new file"),
+    ("/re",     "open a previous file from vault"),
+    ("/title",  "rename the current title"),
+    ("/vault",  "manage vault"),
+];
+
+// Vault sub-commands: (name, description).
+const VAULT_SUBCMDS: &[(&str, &str)] = &[
+    ("new",   "switch to a new vault"),
+    ("reset", "move vault to a new location"),
+];
+
 #[derive(Serialize, Deserialize, Default)]
 struct AppState {
     vault_path: Option<PathBuf>,
@@ -31,13 +51,23 @@ struct SeWriterApp {
     last_sent_title: String,
     is_hidden: bool,
     ime_preedit: String,
+    command_input: String,
+    command_selected: usize,
+    command_panel_id: u32,      // changes each open so egui forgets stored cursor state
+    command_parent: Option<String>, // tracks current command sub-level
+    rename_old_title: String,       // saved title for Esc-cancel in RenameTitle mode
+    command_re_selected_title: String, // base title chosen in /re level 2
+    command_saved_selections: std::collections::HashMap<String, usize>, // saved selection per level
+    command_panel_needs_scroll: bool, // scroll to selected on next frame
 }
 
 #[derive(PartialEq)]
 enum InputMode {
     SelectVault,
     InputTitle,
+    RenameTitle,
     EditContent,
+    CommandPanel,
 }
 
 impl SeWriterApp {
@@ -81,7 +111,67 @@ impl SeWriterApp {
             last_sent_title: String::new(),
             is_hidden: false,
             ime_preedit: String::new(),
+            command_input: String::new(),
+            command_selected: 0,
+            command_panel_id: 0,
+            command_parent: None,
+            rename_old_title: String::new(),
+            command_re_selected_title: String::new(),
+            command_saved_selections: std::collections::HashMap::new(),
+            command_panel_needs_scroll: false,
         }
+    }
+
+    // Returns deduplicated base titles found in the vault (strips -N / -tmp suffixes).
+    fn list_vault_titles(&self) -> Vec<String> {
+        let Some(vault) = &self.state.vault_path else { return vec![] };
+        let Ok(entries) = fs::read_dir(vault) else { return vec![] };
+        let mut titles = std::collections::BTreeSet::new();
+        for entry in entries.flatten() {
+            let os_name = entry.file_name();
+            let name = os_name.to_string_lossy();
+            if !name.ends_with(".txt") { continue; }
+            let stem = &name[..name.len() - 4];
+            let base = if let Some(pos) = stem.rfind('-') {
+                let suffix = &stem[pos + 1..];
+                if suffix == "tmp" || suffix.chars().all(|c| c.is_ascii_digit()) {
+                    &stem[..pos]
+                } else { stem }
+            } else { stem };
+            if !base.is_empty() { titles.insert(base.to_string()); }
+        }
+        titles.into_iter().collect()
+    }
+
+    // Returns (display_name, full_path) for all files of a given base title.
+    // -tmp first, then numbered files in reverse order (highest number first).
+    fn list_vault_files_for_title(&self, title: &str) -> Vec<(String, String)> {
+        let Some(vault) = &self.state.vault_path else { return vec![] };
+        let Ok(entries) = fs::read_dir(vault) else { return vec![] };
+        let prefix = format!("{}-", title);
+        let mut tmp_file: Option<(String, String)> = None;
+        let mut numbered: Vec<(u32, String, String)> = vec![];
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let os_name = entry.file_name();
+            let name = os_name.to_string_lossy();
+            if !name.ends_with(".txt") { continue; }
+            let stem = &name[..name.len() - 4];
+            if !stem.starts_with(prefix.as_str()) { continue; }
+            let suffix = &stem[prefix.len()..];
+            let display = stem.to_string();
+            let path_str = path.to_string_lossy().to_string();
+            if suffix == "tmp" {
+                tmp_file = Some((display, path_str));
+            } else if let Ok(n) = suffix.parse::<u32>() {
+                numbered.push((n, display, path_str));
+            }
+        }
+        numbered.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut result = vec![];
+        if let Some(f) = tmp_file { result.push(f); }
+        for (_, display, path) in numbered { result.push((display, path)); }
+        result
     }
 
     fn save_state(&self) {
@@ -214,6 +304,18 @@ impl eframe::App for SeWriterApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        // Cmd+/: open command panel (must be before the match so request_focus
+        // is consumed by CommandPanel's TextEdit, not EditContent's).
+        if self.input_mode == InputMode::EditContent
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash))
+        {
+            self.input_mode = InputMode::CommandPanel;
+            self.command_input = "/".to_string();
+            self.command_selected = 0;
+            self.command_panel_id = self.command_panel_id.wrapping_add(1);
+            self.request_focus = true;
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.input_mode {
                 InputMode::SelectVault => {
@@ -238,28 +340,210 @@ impl eframe::App for SeWriterApp {
                     });
                 }
                 InputMode::InputTitle => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(200.0);
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.state.current_title)
-                                .hint_text("title")
-                                .font(egui::TextStyle::Heading)
+                    ui.add_space(20.0);
+                    let te_out = egui::TextEdit::singleline(&mut self.state.current_title)
+                        .hint_text("Title")
+                        .font(egui::TextStyle::Heading)
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut |ui, text, wrap_width| {
+                            let mut job = egui::text::LayoutJob::simple(
+                                text.to_string(),
+                                egui::FontId::proportional(TITLE_FONT_SIZE),
+                                ui.visuals().text_color(),
+                                wrap_width,
+                            );
+                            for section in &mut job.sections {
+                                section.format.line_height = Some(TITLE_LINE_HEIGHT);
+                            }
+                            ui.fonts(|f| f.layout_job(job))
+                        })
+                        .show(ui);
+
+                    let shift_y = (TITLE_LINE_HEIGHT - TITLE_FONT_SIZE) / 2.0;
+                    let rounding = ui.style().interact(&te_out.response).rounding;
+
+                    // Always cover egui's rendering so we can paint at the correct vertical position.
+                    ui.painter().rect_filled(te_out.response.rect, rounding, ui.visuals().extreme_bg_color);
+
+                    if self.state.current_title.is_empty() {
+                        // Hint text centered in the row.
+                        let hint_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                            "Title".to_string(),
+                            egui::FontId::proportional(TITLE_FONT_SIZE),
+                            ui.visuals().weak_text_color(),
+                            f32::INFINITY,
+                        )));
+                        ui.painter().galley(
+                            te_out.galley_pos + egui::vec2(0.0, shift_y),
+                            hint_galley,
+                            ui.visuals().weak_text_color(),
                         );
+                    } else {
+                        // Selection
+                        if let Some(ref cursor_range) = te_out.cursor_range {
+                            if !cursor_range.is_empty() {
+                                let [min_c, max_c] = cursor_range.sorted_cursors();
+                                let rows = &te_out.galley.rows;
+                                let last_row = rows.len().saturating_sub(1);
+                                for ri in min_c.rcursor.row..=max_c.rcursor.row.min(last_row) {
+                                    let row = &rows[ri];
+                                    let left = if ri == min_c.rcursor.row { row.x_offset(min_c.rcursor.column) } else { row.rect.left() };
+                                    let right = if ri == max_c.rcursor.row { row.x_offset(max_c.rcursor.column) } else { row.rect.right() };
+                                    let center_y = te_out.galley_pos.y + row.rect.center().y;
+                                    let sel_rect = egui::Rect::from_x_y_ranges(
+                                        (te_out.galley_pos.x + left)..=(te_out.galley_pos.x + right),
+                                        (center_y - TITLE_CURSOR_HEIGHT / 2.0)..=(center_y + TITLE_CURSOR_HEIGHT / 2.0),
+                                    );
+                                    ui.painter().rect_filled(sel_rect, 0.0, ui.visuals().selection.bg_fill);
+                                }
+                            }
+                        }
+
+                        // Clean galley shifted
+                        let clean_galley = ui.fonts(|f| f.layout_job((*te_out.galley.job).clone()));
+                        ui.painter().galley(
+                            te_out.galley_pos + egui::vec2(0.0, shift_y),
+                            clean_galley,
+                            ui.visuals().text_color(),
+                        );
+                    }
+
+                    // Cursor (always drawn manually since egui's cursor is hidden globally)
+                    if te_out.response.has_focus() {
+                        if let Some(ref cursor_range) = te_out.cursor_range {
+                            let row_rect = te_out.galley.pos_from_cursor(&cursor_range.primary);
+                            let screen_pos = egui::pos2(
+                                te_out.galley_pos.x + row_rect.min.x,
+                                te_out.galley_pos.y + row_rect.center().y,
+                            );
+                            let cursor_rect = egui::Rect::from_center_size(
+                                screen_pos,
+                                egui::vec2(2.0, TITLE_CURSOR_HEIGHT),
+                            );
+                            let time = ui.input(|i| i.time);
+                            if (time % 2.0) < 1.0 {
+                                ui.painter().rect_filled(cursor_rect, 0.0, ui.visuals().text_color());
+                            }
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                        }
+                    }
+
+                    if self.request_focus {
+                        te_out.response.request_focus();
+                        self.request_focus = false;
+                    }
+
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.state.current_title.is_empty() {
+                        self.state.last_edit_date = Some(Local::now().format("%Y-%m-%d").to_string());
+                        self.state.current_content = String::new();
+                        self.load_tmp_file();
+                        self.input_mode = InputMode::EditContent;
+                        self.request_focus = true;
+                        self.save_state();
+                    }
+                }
+                InputMode::RenameTitle => {
+                    // Esc: cancel, restore old title.
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                        self.state.current_title = self.rename_old_title.clone();
+                        self.input_mode = InputMode::EditContent;
+                        self.request_focus = true;
+                    } else {
+                        ui.add_space(20.0);
+                        let te_out = egui::TextEdit::singleline(&mut self.state.current_title)
+                            .hint_text("Title")
+                            .font(egui::TextStyle::Heading)
+                            .desired_width(f32::INFINITY)
+                            .layouter(&mut |ui, text, wrap_width| {
+                                let mut job = egui::text::LayoutJob::simple(
+                                    text.to_string(),
+                                    egui::FontId::proportional(TITLE_FONT_SIZE),
+                                    ui.visuals().text_color(),
+                                    wrap_width,
+                                );
+                                for section in &mut job.sections {
+                                    section.format.line_height = Some(TITLE_LINE_HEIGHT);
+                                }
+                                ui.fonts(|f| f.layout_job(job))
+                            })
+                            .show(ui);
+
+                        let shift_y = (TITLE_LINE_HEIGHT - TITLE_FONT_SIZE) / 2.0;
+                        let rounding = ui.style().interact(&te_out.response).rounding;
+                        ui.painter().rect_filled(te_out.response.rect, rounding, ui.visuals().extreme_bg_color);
+
+                        if self.state.current_title.is_empty() {
+                            let hint_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                                "Title".to_string(), egui::FontId::proportional(TITLE_FONT_SIZE),
+                                ui.visuals().weak_text_color(), f32::INFINITY,
+                            )));
+                            ui.painter().galley(
+                                te_out.galley_pos + egui::vec2(0.0, shift_y),
+                                hint_galley, ui.visuals().weak_text_color(),
+                            );
+                        } else {
+                            if let Some(ref cursor_range) = te_out.cursor_range {
+                                if !cursor_range.is_empty() {
+                                    let [min_c, max_c] = cursor_range.sorted_cursors();
+                                    let rows = &te_out.galley.rows;
+                                    let last_row = rows.len().saturating_sub(1);
+                                    for ri in min_c.rcursor.row..=max_c.rcursor.row.min(last_row) {
+                                        let row = &rows[ri];
+                                        let left = if ri == min_c.rcursor.row { row.x_offset(min_c.rcursor.column) } else { row.rect.left() };
+                                        let right = if ri == max_c.rcursor.row { row.x_offset(max_c.rcursor.column) } else { row.rect.right() };
+                                        let center_y = te_out.galley_pos.y + row.rect.center().y;
+                                        let sel_rect = egui::Rect::from_x_y_ranges(
+                                            (te_out.galley_pos.x + left)..=(te_out.galley_pos.x + right),
+                                            (center_y - TITLE_CURSOR_HEIGHT / 2.0)..=(center_y + TITLE_CURSOR_HEIGHT / 2.0),
+                                        );
+                                        ui.painter().rect_filled(sel_rect, 0.0, ui.visuals().selection.bg_fill);
+                                    }
+                                }
+                            }
+                            let clean_galley = ui.fonts(|f| f.layout_job((*te_out.galley.job).clone()));
+                            ui.painter().galley(
+                                te_out.galley_pos + egui::vec2(0.0, shift_y),
+                                clean_galley, ui.visuals().text_color(),
+                            );
+                        }
+
+                        if te_out.response.has_focus() {
+                            if let Some(ref cursor_range) = te_out.cursor_range {
+                                let row_rect = te_out.galley.pos_from_cursor(&cursor_range.primary);
+                                let screen_pos = egui::pos2(
+                                    te_out.galley_pos.x + row_rect.min.x,
+                                    te_out.galley_pos.y + row_rect.center().y,
+                                );
+                                let cursor_rect = egui::Rect::from_center_size(
+                                    screen_pos, egui::vec2(2.0, TITLE_CURSOR_HEIGHT),
+                                );
+                                let time = ui.input(|i| i.time);
+                                if (time % 2.0) < 1.0 {
+                                    ui.painter().rect_filled(cursor_rect, 0.0, ui.visuals().text_color());
+                                }
+                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                            }
+                        }
 
                         if self.request_focus {
-                            response.request_focus();
+                            te_out.response.request_focus();
                             self.request_focus = false;
                         }
 
                         if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.state.current_title.is_empty() {
-                            self.state.last_edit_date = Some(Local::now().format("%Y-%m-%d").to_string());
-                            self.state.current_content = String::new();
-                            self.load_tmp_file();
+                            // Rename the tmp file on disk if it exists.
+                            if let Some(vault) = &self.state.vault_path {
+                                let old_tmp = vault.join(format!("{}-tmp.txt", self.rename_old_title));
+                                let new_tmp = vault.join(format!("{}-tmp.txt", self.state.current_title));
+                                if old_tmp.exists() {
+                                    fs::rename(&old_tmp, &new_tmp).ok();
+                                }
+                            }
                             self.input_mode = InputMode::EditContent;
                             self.request_focus = true;
                             self.save_state();
                         }
-                    });
+                    }
                 }
                 InputMode::EditContent => {
                     // IME backspace fix: on macOS Pinyin, pressing backspace when only
@@ -402,7 +686,7 @@ impl eframe::App for SeWriterApp {
                                         );
                                     }
                                     ui.ctx().request_repaint_after(
-                                        std::time::Duration::from_millis(1000),
+                                        std::time::Duration::from_millis(500),
                                     );
                                 }
                             }
@@ -439,6 +723,357 @@ impl eframe::App for SeWriterApp {
                         self.auto_save();
                     }
                 }
+                InputMode::CommandPanel => {
+                    // IME backspace fix (same as EditContent).
+                    if !self.ime_preedit.is_empty() {
+                        ctx.input_mut(|i| {
+                            if let Some(pos) = i.events.iter().position(|e| {
+                                matches!(e, egui::Event::Ime(egui::ImeEvent::Disabled))
+                            }) {
+                                i.events.insert(
+                                    pos,
+                                    egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
+                                );
+                            }
+                        });
+                    }
+
+                    // Consume navigation/action keys before the TextEdit sees them.
+                    let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                    let up = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+                    let down = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
+                    let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                    let backspace_when_empty = self.command_input.is_empty()
+                        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace));
+
+                    let parent = self.command_parent.clone();
+                    if esc || backspace_when_empty {
+                        match parent.as_deref() {
+                            None => {
+                                self.input_mode = InputMode::EditContent;
+                                self.request_focus = true;
+                            }
+                            Some("/re-files") => {
+                                // Level 3 → back to level 2; save /re-files pos, restore /re pos.
+                                self.command_saved_selections.insert("/re-files".to_string(), self.command_selected);
+                                let restored = self.command_saved_selections.get("/re").copied().unwrap_or(0);
+                                self.command_parent = Some("/re".to_string());
+                                self.command_input = String::new();
+                                self.command_selected = restored;
+                                self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                self.command_panel_needs_scroll = true;
+                                self.request_focus = true;
+                            }
+                            _ => {
+                                // Any other sub-level → back to root; save current pos, restore root pos.
+                                let key = parent.as_deref().unwrap_or("").to_string();
+                                self.command_saved_selections.insert(key, self.command_selected);
+                                let restored = self.command_saved_selections.get("").copied().unwrap_or(0);
+                                self.command_parent = None;
+                                self.command_input = "/".to_string();
+                                self.command_selected = restored;
+                                self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                self.command_panel_needs_scroll = true;
+                                self.request_focus = true;
+                            }
+                        }
+                    } else {
+                        // Build dynamic lists for /re levels.
+                        let vault_titles: Vec<String> = if parent.as_deref() == Some("/re") {
+                            self.list_vault_titles()
+                        } else { vec![] };
+                        let vault_files: Vec<(String, String)> = if parent.as_deref() == Some("/re-files") {
+                            let t = self.command_re_selected_title.clone();
+                            self.list_vault_files_for_title(&t)
+                        } else { vec![] };
+
+                        // Build the filtered list: (display, key, desc).
+                        let inp = &self.command_input;
+                        let filtered: Vec<(String, String, String)> = match parent.as_deref() {
+                            None => COMMANDS.iter()
+                                .filter(|(n, _)| inp.is_empty() || n.starts_with(inp.as_str()))
+                                .map(|&(n, d)| (n.to_string(), n.to_string(), d.to_string()))
+                                .collect(),
+                            Some("/vault") => VAULT_SUBCMDS.iter()
+                                .filter(|(n, _)| inp.is_empty() || n.starts_with(inp.as_str()))
+                                .map(|&(n, d)| (n.to_string(), n.to_string(), d.to_string()))
+                                .collect(),
+                            Some("/re") => vault_titles.iter()
+                                .filter(|t| inp.is_empty() || t.starts_with(inp.as_str()))
+                                .map(|t| (t.clone(), t.clone(), String::new()))
+                                .collect(),
+                            Some("/re-files") => vault_files.iter()
+                                .filter(|(d, _)| inp.is_empty() || d.starts_with(inp.as_str()))
+                                .map(|(d, p)| (d.clone(), p.clone(), String::new()))
+                                .collect(),
+                            _ => vec![],
+                        };
+
+                        // Clamp / update selection after typing.
+                        if filtered.is_empty() {
+                            self.command_selected = 0;
+                        } else {
+                            self.command_selected = self.command_selected.min(filtered.len() - 1);
+                        }
+                        if up && self.command_selected > 0 { self.command_selected -= 1; }
+                        if down && !filtered.is_empty() && self.command_selected + 1 < filtered.len() {
+                            self.command_selected += 1;
+                        }
+
+                        if enter {
+                            if let Some((_, key, _)) = filtered.get(self.command_selected) {
+                                let key = key.clone();
+                                match (parent.as_deref(), key.as_str()) {
+                                    (None, "/new") => {
+                                        self.save_final();
+                                        self.state.current_title = String::new();
+                                        self.state.current_content = String::new();
+                                        self.input_mode = InputMode::InputTitle;
+                                        self.request_focus = true;
+                                    }
+                                    (None, "/finish") => {
+                                        self.save_final();
+                                        self.state.current_title = String::new();
+                                        self.state.current_content = String::new();
+                                        self.input_mode = InputMode::InputTitle;
+                                        self.hide(ctx);
+                                    }
+                                    (None, "/title") => {
+                                        self.rename_old_title = self.state.current_title.clone();
+                                        self.input_mode = InputMode::RenameTitle;
+                                        self.request_focus = true;
+                                    }
+                                    (None, "/vault") => {
+                                        self.command_saved_selections.insert("".to_string(), self.command_selected);
+                                        let restored = self.command_saved_selections.get("/vault").copied().unwrap_or(0);
+                                        self.command_parent = Some("/vault".to_string());
+                                        self.command_input = String::new();
+                                        self.command_selected = restored;
+                                        self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                self.command_panel_needs_scroll = true;
+                                        self.request_focus = true;
+                                    }
+                                    (None, "/re") => {
+                                        self.command_saved_selections.insert("".to_string(), self.command_selected);
+                                        let restored = self.command_saved_selections.get("/re").copied().unwrap_or(0);
+                                        self.command_parent = Some("/re".to_string());
+                                        self.command_input = String::new();
+                                        self.command_selected = restored;
+                                        self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                self.command_panel_needs_scroll = true;
+                                        self.request_focus = true;
+                                    }
+                                    (Some("/vault"), "new") => {
+                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                            self.state.vault_path = Some(path);
+                                            self.save_state();
+                                        }
+                                        self.command_parent = None;
+                                        self.input_mode = InputMode::EditContent;
+                                        self.request_focus = true;
+                                    }
+                                    (Some("/vault"), "reset") => {
+                                        if let Some(new_path) = rfd::FileDialog::new().pick_folder() {
+                                            if let Some(old_path) = self.state.vault_path.clone() {
+                                                if let Ok(entries) = fs::read_dir(&old_path) {
+                                                    for entry in entries.flatten() {
+                                                        let dst = new_path.join(entry.file_name());
+                                                        fs::rename(entry.path(), dst).ok();
+                                                    }
+                                                }
+                                            }
+                                            self.state.vault_path = Some(new_path);
+                                            self.save_state();
+                                        }
+                                        self.command_parent = None;
+                                        self.input_mode = InputMode::EditContent;
+                                        self.request_focus = true;
+                                    }
+                                    (Some("/re"), title) => {
+                                        // Drill into file list for this title.
+                                        self.command_saved_selections.insert("/re".to_string(), self.command_selected);
+                                        let restored = self.command_saved_selections.get("/re-files").copied().unwrap_or(0);
+                                        self.command_re_selected_title = title.to_string();
+                                        self.command_parent = Some("/re-files".to_string());
+                                        self.command_input = String::new();
+                                        self.command_selected = restored;
+                                        self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                self.command_panel_needs_scroll = true;
+                                        self.request_focus = true;
+                                    }
+                                    (Some("/re-files"), path) => {
+                                        // Open the selected file.
+                                        if let Ok(content) = fs::read_to_string(&path) {
+                                            self.state.current_content = content;
+                                            self.state.current_title = self.command_re_selected_title.clone();
+                                            self.state.last_edit_date = Some(Local::now().format("%Y-%m-%d").to_string());
+                                            self.save_state();
+                                        }
+                                        self.command_parent = None;
+                                        self.input_mode = InputMode::EditContent;
+                                        self.request_focus = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        // Render the panel only if we're still in CommandPanel mode.
+                        if self.input_mode == InputMode::CommandPanel {
+                            ui.add_space(20.0);
+
+                            let hint_text = if self.command_parent.is_none() { "/" } else { "" };
+                            let te_out = egui::TextEdit::singleline(&mut self.command_input)
+                                .id_source(self.command_panel_id)
+                                .font(egui::TextStyle::Body)
+                                .desired_width(f32::INFINITY)
+                                .cursor_at_end(true)
+                                .layouter(&mut |ui, text, wrap_width| {
+                                    let mut job = egui::text::LayoutJob::simple(
+                                        text.to_string(),
+                                        egui::FontId::proportional(FONT_SIZE),
+                                        ui.visuals().text_color(),
+                                        wrap_width,
+                                    );
+                                    for section in &mut job.sections {
+                                        section.format.line_height = Some(LINE_HEIGHT);
+                                    }
+                                    ui.fonts(|f| f.layout_job(job))
+                                })
+                                .show(ui);
+
+                            let shift_y = (LINE_HEIGHT - FONT_SIZE) / 2.0;
+                            let rounding = ui.style().interact(&te_out.response).rounding;
+                            ui.painter().rect_filled(te_out.response.rect, rounding, ui.visuals().extreme_bg_color);
+
+                            if self.command_input.is_empty() && !hint_text.is_empty() {
+                                let hint_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                                    hint_text.to_string(),
+                                    egui::FontId::proportional(FONT_SIZE),
+                                    ui.visuals().weak_text_color(),
+                                    f32::INFINITY,
+                                )));
+                                ui.painter().galley(
+                                    te_out.galley_pos + egui::vec2(0.0, shift_y),
+                                    hint_galley,
+                                    ui.visuals().weak_text_color(),
+                                );
+                            } else {
+                                if let Some(ref cursor_range) = te_out.cursor_range {
+                                    if !cursor_range.is_empty() {
+                                        let [min_c, max_c] = cursor_range.sorted_cursors();
+                                        let rows = &te_out.galley.rows;
+                                        let last_row = rows.len().saturating_sub(1);
+                                        for ri in min_c.rcursor.row..=max_c.rcursor.row.min(last_row) {
+                                            let row = &rows[ri];
+                                            let left = if ri == min_c.rcursor.row { row.x_offset(min_c.rcursor.column) } else { row.rect.left() };
+                                            let right = if ri == max_c.rcursor.row { row.x_offset(max_c.rcursor.column) } else { row.rect.right() };
+                                            let center_y = te_out.galley_pos.y + row.rect.center().y;
+                                            let sel_rect = egui::Rect::from_x_y_ranges(
+                                                (te_out.galley_pos.x + left)..=(te_out.galley_pos.x + right),
+                                                (center_y - CURSOR_HEIGHT / 2.0)..=(center_y + CURSOR_HEIGHT / 2.0),
+                                            );
+                                            ui.painter().rect_filled(sel_rect, 0.0, ui.visuals().selection.bg_fill);
+                                        }
+                                    }
+                                }
+                                let clean_galley = ui.fonts(|f| f.layout_job((*te_out.galley.job).clone()));
+                                ui.painter().galley(
+                                    te_out.galley_pos + egui::vec2(0.0, shift_y),
+                                    clean_galley,
+                                    ui.visuals().text_color(),
+                                );
+                            }
+
+                            // Cursor
+                            if te_out.response.has_focus() {
+                                if let Some(ref cursor_range) = te_out.cursor_range {
+                                    let row_rect = te_out.galley.pos_from_cursor(&cursor_range.primary);
+                                    let screen_pos = egui::pos2(
+                                        te_out.galley_pos.x + row_rect.min.x,
+                                        te_out.galley_pos.y + row_rect.center().y,
+                                    );
+                                    let cursor_rect = egui::Rect::from_center_size(
+                                        screen_pos, egui::vec2(2.0, CURSOR_HEIGHT),
+                                    );
+                                    let time = ui.input(|i| i.time);
+                                    if (time % 2.0) < 1.0 {
+                                        ui.painter().rect_filled(cursor_rect, 0.0, ui.visuals().text_color());
+                                    }
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                                }
+                            }
+
+                            if self.request_focus {
+                                te_out.response.request_focus();
+                                self.request_focus = false;
+                            }
+                            if te_out.response.changed() {
+                                self.command_selected = 0;
+                            }
+
+                            ctx.input(|i| {
+                                for e in &i.events {
+                                    match e {
+                                        egui::Event::Ime(egui::ImeEvent::Preedit(s)) => {
+                                            self.ime_preedit = s.clone();
+                                        }
+                                        egui::Event::Ime(egui::ImeEvent::Disabled)
+                                        | egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                                            self.ime_preedit = String::new();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+
+                            ui.add_space(8.0);
+
+                            let should_scroll = up || down || self.command_panel_needs_scroll;
+                            self.command_panel_needs_scroll = false;
+
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                let avail_width = ui.available_width();
+                                let mut selected_rect: Option<egui::Rect> = None;
+                                for (i, (display, _, desc)) in filtered.iter().enumerate() {
+                                    let is_selected = i == self.command_selected;
+                                    let (row_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(avail_width, LINE_HEIGHT), egui::Sense::hover(),
+                                    );
+                                    if is_selected {
+                                        ui.painter().rect_filled(row_rect, 0.0, ui.visuals().selection.bg_fill);
+                                        selected_rect = Some(row_rect);
+                                    }
+                                    let name_color = ui.visuals().text_color();
+                                    let desc_color = if is_selected { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+
+                                    let name_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                                        display.clone(), egui::FontId::proportional(FONT_SIZE), name_color, f32::INFINITY,
+                                    )));
+                                    let name_width = name_galley.rect.width();
+                                    ui.painter().galley(
+                                        egui::pos2(row_rect.left() + 8.0, row_rect.top() + shift_y),
+                                        name_galley, name_color,
+                                    );
+                                    let desc_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                                        desc.to_string(), egui::FontId::proportional(FONT_SIZE), desc_color, f32::INFINITY,
+                                    )));
+                                    ui.painter().galley(
+                                        egui::pos2(row_rect.left() + 8.0 + name_width + 16.0, row_rect.top() + shift_y),
+                                        desc_galley, desc_color,
+                                    );
+                                }
+                                if should_scroll {
+                                    if let Some(rect) = selected_rect {
+                                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
             }
         });
 
@@ -449,20 +1084,65 @@ impl eframe::App for SeWriterApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     let count = self.get_next_save_count();
-                    ui.label(format!("The file will be saved as {}-{}.txt", self.state.current_title, count));
-                    ui.label(format!("Changes have been automatically saved as {}-tmp.txt", self.state.current_title));
-                    ui.add_space(10.0);
-
+                    let shift_y = (LINE_HEIGHT - FONT_SIZE) / 2.0;
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    let avail_w = ui.available_width();
+
+                    // Labels: allocate each label's actual galley height (no fixed LINE_HEIGHT)
+                    // so wrapped text is never clipped.
+                    let g1 = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                        format!("The file will be saved as {}-{}.txt", self.state.current_title, count),
+                        egui::FontId::proportional(FONT_SIZE), ui.visuals().text_color(), avail_w,
+                    )));
+                    let (r1, _) = ui.allocate_exact_size(egui::vec2(avail_w, g1.rect.height()), egui::Sense::hover());
+                    ui.painter().galley(r1.min, g1, ui.visuals().text_color());
+
+                    ui.add_space(4.0);
+
+                    let g2 = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                        format!("Changes have been automatically saved as {}-tmp.txt", self.state.current_title),
+                        egui::FontId::proportional(FONT_SIZE), ui.visuals().text_color(), avail_w,
+                    )));
+                    let (r2, _) = ui.allocate_exact_size(egui::vec2(avail_w, g2.rect.height()), egui::Sense::hover());
+                    ui.painter().galley(r2.min, g2, ui.visuals().text_color());
+
+                    ui.add_space(8.0);
+
+                    // Pre-measure buttons so we can center them horizontally.
+                    let g_save = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                        "Save&Close".to_string(), egui::FontId::proportional(FONT_SIZE),
+                        egui::Color32::PLACEHOLDER, f32::INFINITY,
+                    )));
+                    let g_cancel = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
+                        "Cancel".to_string(), egui::FontId::proportional(FONT_SIZE),
+                        egui::Color32::PLACEHOLDER, f32::INFINITY,
+                    )));
+                    let save_w = g_save.rect.width() + 16.0;
+                    let cancel_w = g_cancel.rect.width() + 16.0;
+                    let btn_gap = 64.0;
+                    let offset = ((avail_w - save_w - btn_gap - cancel_w) / 2.0).max(0.0);
 
                     ui.horizontal(|ui| {
-                        if ui.button("Save and close").clicked() || enter_pressed {
+                        ui.add_space(offset);
+
+                        let (br_save, resp_save) = ui.allocate_exact_size(egui::vec2(save_w, LINE_HEIGHT), egui::Sense::click());
+                        let vis_save = ui.style().interact(&resp_save);
+                        ui.painter().rect(br_save, vis_save.rounding, vis_save.bg_fill, vis_save.bg_stroke);
+                        ui.painter().galley(egui::pos2(br_save.left() + 8.0, br_save.top() + shift_y), g_save, vis_save.fg_stroke.color);
+                        if resp_save.clicked() || enter_pressed {
                             self.save_final();
                             self.show_save_dialog = false;
                             self.hide(ctx);
                         }
-                        if ui.button("Cancel").clicked() || esc_pressed {
+
+                        ui.add_space(btn_gap);
+
+                        let (br_cancel, resp_cancel) = ui.allocate_exact_size(egui::vec2(cancel_w, LINE_HEIGHT), egui::Sense::click());
+                        let vis_cancel = ui.style().interact(&resp_cancel);
+                        ui.painter().rect(br_cancel, vis_cancel.rounding, vis_cancel.bg_fill, vis_cancel.bg_stroke);
+                        ui.painter().galley(egui::pos2(br_cancel.left() + 8.0, br_cancel.top() + shift_y), g_cancel, vis_cancel.fg_stroke.color);
+                        if resp_cancel.clicked() || esc_pressed {
                             self.show_save_dialog = false;
                             self.request_focus = true;
                         }
