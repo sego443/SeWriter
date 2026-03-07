@@ -30,6 +30,7 @@ struct SeWriterApp {
     request_focus: bool,
     last_sent_title: String,
     is_hidden: bool,
+    ime_preedit: String,
 }
 
 #[derive(PartialEq)]
@@ -79,6 +80,7 @@ impl SeWriterApp {
             request_focus: true,
             last_sent_title: String::new(),
             is_hidden: false,
+            ime_preedit: String::new(),
         }
     }
 
@@ -260,6 +262,28 @@ impl eframe::App for SeWriterApp {
                     });
                 }
                 InputMode::EditContent => {
+                    // IME backspace fix: on macOS Pinyin, pressing backspace when only
+                    // one preedit char remains sends Ime(Disabled) instead of Preedit("").
+                    // TextEdit's Disabled handler only sets ime_enabled=false — it never
+                    // deletes the preedit text from content. The Preedit("") handler
+                    // does call delete_selected() which correctly clears it, so we inject
+                    // a synthetic Preedit("") immediately before Disabled to match the
+                    // normal multi-char-preedit backspace behaviour (one press to delete).
+                    // Note: Key::Backspace cannot be used here — egui removes it while
+                    // ime_enabled is true via remove_ime_incompatible_events().
+                    if !self.ime_preedit.is_empty() {
+                        ctx.input_mut(|i| {
+                            if let Some(pos) = i.events.iter().position(|e| {
+                                matches!(e, egui::Event::Ime(egui::ImeEvent::Disabled))
+                            }) {
+                                i.events.insert(
+                                    pos,
+                                    egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
+                                );
+                            }
+                        });
+                    }
+
                     let scroll_out = egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -289,44 +313,78 @@ impl eframe::App for SeWriterApp {
                             // Center text within each LINE_HEIGHT row.
                             //
                             // epaint always places glyphs at the row top; the extra space from
-                            // LINE_HEIGHT accumulates at the bottom. We shift the galley down by
-                            // shift_y = (LINE_HEIGHT - natural_row_h) / 2 to center the glyphs.
+                            // LINE_HEIGHT accumulates at the bottom. shift_y shifts the galley
+                            // down so glyphs are vertically centered. We use FONT_SIZE (not
+                            // row_height()) because row_height() includes line_gap (empty space
+                            // below glyphs) which would under-shift.
                             //
-                            // Steps:
-                            //   1. Cover the inner text area with extreme_bg_color (same color
-                            //      egui uses for the TextEdit background) to erase the original
-                            //      unshifted text while leaving the frame border intact.
-                            //   2. Repaint the galley at galley_pos + shift_y. Selection
-                            //      highlights are baked into the galley mesh by TextEdit before
-                            //      returning TextEditOutput, so they shift with the text.
-                            //   3. Draw the cursor at row_rect.center().y, which equals
-                            //      shift_y + natural_row_h/2 — exactly the shifted text center.
-                            //
-                            // egui's built-in cursor is hidden via style (stroke = NONE).
-                            // shift_y centers the glyph body (height ≈ FONT_SIZE) within
-                            // each LINE_HEIGHT row. Using FONT_SIZE here, not row_height(),
-                            // because row_height() includes the line_gap which is empty space
-                            // below the glyphs — using it would under-shift by half the gap.
+                            // Selection highlights are baked into te_out.galley at full row
+                            // height (0..LINE_HEIGHT), which after shifting places them too low.
+                            // Fix: draw selection rects manually at CURSOR_HEIGHT centered on
+                            // each row, then repaint a clean galley (no baked selection) shifted.
                             let shift_y = (LINE_HEIGHT - FONT_SIZE) / 2.0;
                             let rounding = ui.style().interact(&te_out.response).rounding;
+
+                            // 1. Cover the original (unshifted) text.
                             ui.painter().rect_filled(
                                 te_out.response.rect,
                                 rounding,
                                 ui.visuals().extreme_bg_color,
                             );
+
+                            // 2. Draw selection rects behind text, centered on each row.
+                            if let Some(ref cursor_range) = te_out.cursor_range {
+                                if !cursor_range.is_empty() {
+                                    let [min_c, max_c] = cursor_range.sorted_cursors();
+                                    let min_rc = min_c.rcursor;
+                                    let max_rc = max_c.rcursor;
+                                    let sel_color = ui.visuals().selection.bg_fill;
+                                    let rows = &te_out.galley.rows;
+                                    let last_row = rows.len().saturating_sub(1);
+                                    for ri in min_rc.row..=max_rc.row.min(last_row) {
+                                        let row = &rows[ri];
+                                        let left = if ri == min_rc.row {
+                                            row.x_offset(min_rc.column)
+                                        } else {
+                                            row.rect.left()
+                                        };
+                                        let right = if ri == max_rc.row {
+                                            row.x_offset(max_rc.column)
+                                        } else {
+                                            let extra = if row.ends_with_newline {
+                                                row.height() / 2.0
+                                            } else {
+                                                0.0
+                                            };
+                                            row.rect.right() + extra
+                                        };
+                                        let center_y = te_out.galley_pos.y + row.rect.center().y;
+                                        let sel_rect = egui::Rect::from_x_y_ranges(
+                                            (te_out.galley_pos.x + left)
+                                                ..=(te_out.galley_pos.x + right),
+                                            (center_y - CURSOR_HEIGHT / 2.0)
+                                                ..=(center_y + CURSOR_HEIGHT / 2.0),
+                                        );
+                                        ui.painter().rect_filled(sel_rect, 0.0, sel_color);
+                                    }
+                                }
+                            }
+
+                            // 3. Repaint a clean galley (no baked selection) at shifted pos.
+                            let clean_galley = ui.fonts(|f| {
+                                f.layout_job((*te_out.galley.job).clone())
+                            });
                             ui.painter().galley(
                                 te_out.galley_pos + egui::vec2(0.0, shift_y),
-                                te_out.galley.clone(),
+                                clean_galley,
                                 ui.visuals().text_color(),
                             );
 
+                            // 4. Draw cursor on top.
                             if te_out.response.has_focus() {
                                 if let Some(ref cursor_range) = te_out.cursor_range {
                                     let row_rect = te_out.galley
                                         .pos_from_cursor(&cursor_range.primary);
-                                    // row_rect.center().y = row_rect.min.y + LINE_HEIGHT/2
-                                    //                     = shift_y + natural_row_h/2
-                                    //                     = center of the shifted text
                                     let screen_pos = egui::pos2(
                                         te_out.galley_pos.x + row_rect.min.x,
                                         te_out.galley_pos.y + row_rect.center().y,
@@ -351,6 +409,25 @@ impl eframe::App for SeWriterApp {
 
                             te_out
                         });
+
+                    // Track preedit content for the IME backspace fix above.
+                    // Only update on explicit IME events — don't reset on idle frames
+                    // (which have no Preedit event), or the fix won't see the preedit
+                    // content when Ime(Disabled) arrives.
+                    ctx.input(|i| {
+                        for e in &i.events {
+                            match e {
+                                egui::Event::Ime(egui::ImeEvent::Preedit(s)) => {
+                                    self.ime_preedit = s.clone();
+                                }
+                                egui::Event::Ime(egui::ImeEvent::Disabled)
+                                | egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                                    self.ime_preedit = String::new();
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
 
                     let te_out = scroll_out.inner;
                     let response = &te_out.response;
