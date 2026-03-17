@@ -59,6 +59,8 @@ struct SeWriterApp {
     command_re_selected_title: String, // base title chosen in /re level 2
     command_saved_selections: std::collections::HashMap<String, usize>, // saved selection per level
     command_panel_needs_scroll: bool, // scroll to selected on next frame
+    cursor_visible: bool,             // current blink state (true = shown)
+    cursor_blink_start: f64,          // time of last toggle; drives next repaint schedule
 }
 
 #[derive(PartialEq)]
@@ -119,6 +121,8 @@ impl SeWriterApp {
             command_re_selected_title: String::new(),
             command_saved_selections: std::collections::HashMap::new(),
             command_panel_needs_scroll: false,
+            cursor_visible: true,
+            cursor_blink_start: 0.0,
         }
     }
 
@@ -264,6 +268,23 @@ impl eframe::App for SeWriterApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Cursor blink state machine — drives exactly 500 ms on / 500 ms off.
+        // Using an explicit toggle avoids the uneven periods caused by `time % N`
+        // (where repaint jitter can make a phase appear 1.5× longer than intended).
+        let time = ctx.input(|i| i.time);
+        {
+            let elapsed = time - self.cursor_blink_start;
+            if elapsed >= 0.5 {
+                self.cursor_visible = !self.cursor_visible;
+                self.cursor_blink_start += 0.5; // step forward, not snap to now — no drift
+                // Catch-up: if we're more than one full period late, just reset.
+                if time - self.cursor_blink_start >= 0.5 {
+                    self.cursor_blink_start = time;
+                }
+            }
+        }
+        let remaining_blink = (0.5 - (time - self.cursor_blink_start)).max(0.016);
+
         // Runtime values from user config.
         let font_size = self.state.font_size;
         let cursor_height = font_size + 4.0;
@@ -423,13 +444,12 @@ impl eframe::App for SeWriterApp {
                             );
                             let cursor_rect = egui::Rect::from_center_size(
                                 screen_pos,
-                                egui::vec2(2.0, TITLE_CURSOR_HEIGHT),
+                                egui::vec2(1.0, TITLE_CURSOR_HEIGHT),
                             );
-                            let time = ui.input(|i| i.time);
-                            if (time % 2.0) < 1.0 {
+                            if self.cursor_visible {
                                 ui.painter().rect_filled(cursor_rect, 0.0, ui.visuals().text_color());
                             }
-                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(remaining_blink));
                         }
                     }
 
@@ -520,13 +540,12 @@ impl eframe::App for SeWriterApp {
                                     te_out.galley_pos.y + row_rect.center().y,
                                 );
                                 let cursor_rect = egui::Rect::from_center_size(
-                                    screen_pos, egui::vec2(2.0, TITLE_CURSOR_HEIGHT),
+                                    screen_pos, egui::vec2(1.0, TITLE_CURSOR_HEIGHT),
                                 );
-                                let time = ui.input(|i| i.time);
-                                if (time % 2.0) < 1.0 {
+                                if self.cursor_visible {
                                     ui.painter().rect_filled(cursor_rect, 0.0, ui.visuals().text_color());
                                 }
-                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(remaining_blink));
                             }
                         }
 
@@ -680,10 +699,9 @@ impl eframe::App for SeWriterApp {
                                     );
                                     let cursor_rect = egui::Rect::from_center_size(
                                         screen_pos,
-                                        egui::vec2(2.0, cursor_height),
+                                        egui::vec2(1.0, cursor_height),
                                     );
-                                    let time = ui.input(|i| i.time);
-                                    if (time % 2.0) < 1.0 {
+                                    if self.cursor_visible {
                                         ui.painter().rect_filled(
                                             cursor_rect,
                                             0.0,
@@ -691,7 +709,7 @@ impl eframe::App for SeWriterApp {
                                         );
                                     }
                                     ui.ctx().request_repaint_after(
-                                        std::time::Duration::from_millis(500),
+                                        std::time::Duration::from_secs_f64(remaining_blink),
                                     );
                                 }
                             }
@@ -1050,13 +1068,12 @@ impl eframe::App for SeWriterApp {
                                         te_out.galley_pos.y + row_rect.center().y,
                                     );
                                     let cursor_rect = egui::Rect::from_center_size(
-                                        screen_pos, egui::vec2(2.0, cursor_height),
+                                        screen_pos, egui::vec2(1.0, cursor_height),
                                     );
-                                    let time = ui.input(|i| i.time);
-                                    if (time % 2.0) < 1.0 {
+                                    if self.cursor_visible {
                                         ui.painter().rect_filled(cursor_rect, 0.0, ui.visuals().text_color());
                                     }
-                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(remaining_blink));
                                 }
                             }
 
