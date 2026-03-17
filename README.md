@@ -10,7 +10,7 @@ Open - Write - Close. That's it.
 
 ## Download
 
-**[→ Download SeWriter for Mac](dist/SeWriter.dmg)** (macOS 12+, Apple Silicon & Intel)
+**[→ Download SeWriter for Mac](https://github.com/sego443/SeWriter/releases/tag/v0.1.0)** (macOS 12+, Apple Silicon & Intel)
 
 ---
 
