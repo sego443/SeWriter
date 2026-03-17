@@ -8,10 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static HOTKEY_FIRED: AtomicBool = AtomicBool::new(false);
 
-// Text and cursor layout constants (will be user-configurable in a future release).
-const FONT_SIZE: f32 = 16.0;
-const CURSOR_HEIGHT: f32 = FONT_SIZE + 4.0;   // slightly taller than the text glyphs
-const LINE_HEIGHT: f32 = CURSOR_HEIGHT + 8.0;  // 4 px of equal padding around the cursor
+fn default_font_size() -> f32 { 16.0 }
 
 // Title input uses the Heading font (24 px); same padding formula as the editor.
 const TITLE_FONT_SIZE: f32 = 24.0;
@@ -20,6 +17,7 @@ const TITLE_LINE_HEIGHT: f32 = TITLE_CURSOR_HEIGHT + 8.0;
 
 // Command palette entries, sorted alphabetically by name.
 const COMMANDS: &[(&str, &str)] = &[
+    ("/config", "adjust settings"),
     ("/finish", "save and close, start fresh next time"),
     ("/new",    "save current and start a new file"),
     ("/re",     "open a previous file from vault"),
@@ -40,6 +38,8 @@ struct AppState {
     current_content: String,
     last_edit_date: Option<String>,
     window_size: Option<[f32; 2]>,
+    #[serde(default = "default_font_size")]
+    font_size: f32,
 }
 
 struct SeWriterApp {
@@ -264,6 +264,11 @@ impl eframe::App for SeWriterApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Runtime values from user config.
+        let font_size = self.state.font_size;
+        let cursor_height = font_size + 4.0;
+        let line_height = font_size + 12.0;
+
         // Track window size in memory — flushed to disk in hide() and on_exit().
         // Comparing rounded values avoids spurious writes from sub-pixel fluctuations.
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
@@ -583,30 +588,30 @@ impl eframe::App for SeWriterApp {
                                 .layouter(&mut |ui, text, wrap_width| {
                                     let mut job = egui::text::LayoutJob::simple(
                                         text.to_string(),
-                                        egui::FontId::proportional(FONT_SIZE),
+                                        egui::FontId::proportional(font_size),
                                         ui.visuals().text_color(),
                                         wrap_width,
                                     );
                                     for section in &mut job.sections {
-                                        section.format.line_height = Some(LINE_HEIGHT);
+                                        section.format.line_height = Some(line_height);
                                     }
                                     ui.fonts(|f| f.layout_job(job))
                                 })
                                 .show(ui);
 
-                            // Center text within each LINE_HEIGHT row.
+                            // Center text within each line_height row.
                             //
                             // epaint always places glyphs at the row top; the extra space from
-                            // LINE_HEIGHT accumulates at the bottom. shift_y shifts the galley
-                            // down so glyphs are vertically centered. We use FONT_SIZE (not
+                            // line_height accumulates at the bottom. shift_y shifts the galley
+                            // down so glyphs are vertically centered. We use font_size (not
                             // row_height()) because row_height() includes line_gap (empty space
                             // below glyphs) which would under-shift.
                             //
                             // Selection highlights are baked into te_out.galley at full row
-                            // height (0..LINE_HEIGHT), which after shifting places them too low.
-                            // Fix: draw selection rects manually at CURSOR_HEIGHT centered on
+                            // height (0..line_height), which after shifting places them too low.
+                            // Fix: draw selection rects manually at cursor_height centered on
                             // each row, then repaint a clean galley (no baked selection) shifted.
-                            let shift_y = (LINE_HEIGHT - FONT_SIZE) / 2.0;
+                            let shift_y = (line_height - font_size) / 2.0;
                             let rounding = ui.style().interact(&te_out.response).rounding;
 
                             // 1. Cover the original (unshifted) text.
@@ -646,8 +651,8 @@ impl eframe::App for SeWriterApp {
                                         let sel_rect = egui::Rect::from_x_y_ranges(
                                             (te_out.galley_pos.x + left)
                                                 ..=(te_out.galley_pos.x + right),
-                                            (center_y - CURSOR_HEIGHT / 2.0)
-                                                ..=(center_y + CURSOR_HEIGHT / 2.0),
+                                            (center_y - cursor_height / 2.0)
+                                                ..=(center_y + cursor_height / 2.0),
                                         );
                                         ui.painter().rect_filled(sel_rect, 0.0, sel_color);
                                     }
@@ -675,7 +680,7 @@ impl eframe::App for SeWriterApp {
                                     );
                                     let cursor_rect = egui::Rect::from_center_size(
                                         screen_pos,
-                                        egui::vec2(2.0, CURSOR_HEIGHT),
+                                        egui::vec2(2.0, cursor_height),
                                     );
                                     let time = ui.input(|i| i.time);
                                     if (time % 2.0) < 1.0 {
@@ -764,6 +769,17 @@ impl eframe::App for SeWriterApp {
                 self.command_panel_needs_scroll = true;
                                 self.request_focus = true;
                             }
+                            Some("/config-font") => {
+                                // /config-font → back to /config.
+                                self.command_saved_selections.insert("/config-font".to_string(), self.command_selected);
+                                let restored = self.command_saved_selections.get("/config").copied().unwrap_or(0);
+                                self.command_parent = Some("/config".to_string());
+                                self.command_input = String::new();
+                                self.command_selected = restored;
+                                self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                                self.command_panel_needs_scroll = true;
+                                self.request_focus = true;
+                            }
                             _ => {
                                 // Any other sub-level → back to root; save current pos, restore root pos.
                                 let key = parent.as_deref().unwrap_or("").to_string();
@@ -798,6 +814,17 @@ impl eframe::App for SeWriterApp {
                                 .filter(|(n, _)| inp.is_empty() || n.starts_with(inp.as_str()))
                                 .map(|&(n, d)| (n.to_string(), n.to_string(), d.to_string()))
                                 .collect(),
+                            Some("/config") => vec![(
+                                "font_size".to_string(),
+                                "font_size".to_string(),
+                                format!("current: {}px  (12–32)", self.state.font_size as u8),
+                            )],
+                            Some("/config-font") => (12u8..=32)
+                                .map(|s| {
+                                    let label = format!("{}px", s);
+                                    (label.clone(), s.to_string(), String::new())
+                                })
+                                .collect(),
                             Some("/re") => vault_titles.iter()
                                 .filter(|t| inp.is_empty() || t.starts_with(inp.as_str()))
                                 .map(|t| (t.clone(), t.clone(), String::new()))
@@ -824,6 +851,35 @@ impl eframe::App for SeWriterApp {
                             if let Some((_, key, _)) = filtered.get(self.command_selected) {
                                 let key = key.clone();
                                 match (parent.as_deref(), key.as_str()) {
+                                    (None, "/config") => {
+                                        self.command_saved_selections.insert("".to_string(), self.command_selected);
+                                        let restored = self.command_saved_selections.get("/config").copied().unwrap_or(0);
+                                        self.command_parent = Some("/config".to_string());
+                                        self.command_input = String::new();
+                                        self.command_selected = restored;
+                                        self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                                        self.command_panel_needs_scroll = true;
+                                        self.request_focus = true;
+                                    }
+                                    (Some("/config"), "font_size") => {
+                                        self.command_saved_selections.insert("/config".to_string(), self.command_selected);
+                                        self.command_parent = Some("/config-font".to_string());
+                                        self.command_input = String::new();
+                                        // Pre-select the row matching the current font size.
+                                        self.command_selected = (self.state.font_size as usize).saturating_sub(12).min(20);
+                                        self.command_panel_id = self.command_panel_id.wrapping_add(1);
+                                        self.command_panel_needs_scroll = true;
+                                        self.request_focus = true;
+                                    }
+                                    (Some("/config-font"), size_str) => {
+                                        if let Ok(size) = size_str.parse::<u8>() {
+                                            self.state.font_size = (size as f32).clamp(12.0, 32.0);
+                                            self.save_state();
+                                        }
+                                        self.command_parent = None;
+                                        self.input_mode = InputMode::EditContent;
+                                        self.request_focus = true;
+                                    }
                                     (None, "/new") => {
                                         self.save_final();
                                         self.state.current_title = String::new();
@@ -931,25 +987,25 @@ impl eframe::App for SeWriterApp {
                                 .layouter(&mut |ui, text, wrap_width| {
                                     let mut job = egui::text::LayoutJob::simple(
                                         text.to_string(),
-                                        egui::FontId::proportional(FONT_SIZE),
+                                        egui::FontId::proportional(font_size),
                                         ui.visuals().text_color(),
                                         wrap_width,
                                     );
                                     for section in &mut job.sections {
-                                        section.format.line_height = Some(LINE_HEIGHT);
+                                        section.format.line_height = Some(line_height);
                                     }
                                     ui.fonts(|f| f.layout_job(job))
                                 })
                                 .show(ui);
 
-                            let shift_y = (LINE_HEIGHT - FONT_SIZE) / 2.0;
+                            let shift_y = (line_height - font_size) / 2.0;
                             let rounding = ui.style().interact(&te_out.response).rounding;
                             ui.painter().rect_filled(te_out.response.rect, rounding, ui.visuals().extreme_bg_color);
 
                             if self.command_input.is_empty() && !hint_text.is_empty() {
                                 let hint_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
                                     hint_text.to_string(),
-                                    egui::FontId::proportional(FONT_SIZE),
+                                    egui::FontId::proportional(font_size),
                                     ui.visuals().weak_text_color(),
                                     f32::INFINITY,
                                 )));
@@ -971,7 +1027,7 @@ impl eframe::App for SeWriterApp {
                                             let center_y = te_out.galley_pos.y + row.rect.center().y;
                                             let sel_rect = egui::Rect::from_x_y_ranges(
                                                 (te_out.galley_pos.x + left)..=(te_out.galley_pos.x + right),
-                                                (center_y - CURSOR_HEIGHT / 2.0)..=(center_y + CURSOR_HEIGHT / 2.0),
+                                                (center_y - cursor_height / 2.0)..=(center_y + cursor_height / 2.0),
                                             );
                                             ui.painter().rect_filled(sel_rect, 0.0, ui.visuals().selection.bg_fill);
                                         }
@@ -994,7 +1050,7 @@ impl eframe::App for SeWriterApp {
                                         te_out.galley_pos.y + row_rect.center().y,
                                     );
                                     let cursor_rect = egui::Rect::from_center_size(
-                                        screen_pos, egui::vec2(2.0, CURSOR_HEIGHT),
+                                        screen_pos, egui::vec2(2.0, cursor_height),
                                     );
                                     let time = ui.input(|i| i.time);
                                     if (time % 2.0) < 1.0 {
@@ -1040,7 +1096,7 @@ impl eframe::App for SeWriterApp {
                                 for (i, (display, _, desc)) in filtered.iter().enumerate() {
                                     let is_selected = i == self.command_selected;
                                     let (row_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(avail_width, LINE_HEIGHT), egui::Sense::hover(),
+                                        egui::vec2(avail_width, line_height), egui::Sense::hover(),
                                     );
                                     if is_selected {
                                         ui.painter().rect_filled(row_rect, 0.0, ui.visuals().selection.bg_fill);
@@ -1050,7 +1106,7 @@ impl eframe::App for SeWriterApp {
                                     let desc_color = if is_selected { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
 
                                     let name_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
-                                        display.clone(), egui::FontId::proportional(FONT_SIZE), name_color, f32::INFINITY,
+                                        display.clone(), egui::FontId::proportional(font_size), name_color, f32::INFINITY,
                                     )));
                                     let name_width = name_galley.rect.width();
                                     ui.painter().galley(
@@ -1058,7 +1114,7 @@ impl eframe::App for SeWriterApp {
                                         name_galley, name_color,
                                     );
                                     let desc_galley = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
-                                        desc.to_string(), egui::FontId::proportional(FONT_SIZE), desc_color, f32::INFINITY,
+                                        desc.to_string(), egui::FontId::proportional(font_size), desc_color, f32::INFINITY,
                                     )));
                                     ui.painter().galley(
                                         egui::pos2(row_rect.left() + 8.0 + name_width + 16.0, row_rect.top() + shift_y),
@@ -1084,16 +1140,16 @@ impl eframe::App for SeWriterApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     let count = self.get_next_save_count();
-                    let shift_y = (LINE_HEIGHT - FONT_SIZE) / 2.0;
+                    let shift_y = (line_height - font_size) / 2.0;
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
                     let avail_w = ui.available_width();
 
-                    // Labels: allocate each label's actual galley height (no fixed LINE_HEIGHT)
+                    // Labels: allocate each label's actual galley height (no fixed line_height)
                     // so wrapped text is never clipped.
                     let g1 = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
                         format!("The file will be saved as {}-{}.txt", self.state.current_title, count),
-                        egui::FontId::proportional(FONT_SIZE), ui.visuals().text_color(), avail_w,
+                        egui::FontId::proportional(font_size), ui.visuals().text_color(), avail_w,
                     )));
                     let (r1, _) = ui.allocate_exact_size(egui::vec2(avail_w, g1.rect.height()), egui::Sense::hover());
                     ui.painter().galley(r1.min, g1, ui.visuals().text_color());
@@ -1102,7 +1158,7 @@ impl eframe::App for SeWriterApp {
 
                     let g2 = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
                         format!("Changes have been automatically saved as {}-tmp.txt", self.state.current_title),
-                        egui::FontId::proportional(FONT_SIZE), ui.visuals().text_color(), avail_w,
+                        egui::FontId::proportional(font_size), ui.visuals().text_color(), avail_w,
                     )));
                     let (r2, _) = ui.allocate_exact_size(egui::vec2(avail_w, g2.rect.height()), egui::Sense::hover());
                     ui.painter().galley(r2.min, g2, ui.visuals().text_color());
@@ -1111,11 +1167,11 @@ impl eframe::App for SeWriterApp {
 
                     // Pre-measure buttons so we can center them horizontally.
                     let g_save = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
-                        "Save&Close".to_string(), egui::FontId::proportional(FONT_SIZE),
+                        "Save&Close".to_string(), egui::FontId::proportional(font_size),
                         egui::Color32::PLACEHOLDER, f32::INFINITY,
                     )));
                     let g_cancel = ui.fonts(|f| f.layout_job(egui::text::LayoutJob::simple(
-                        "Cancel".to_string(), egui::FontId::proportional(FONT_SIZE),
+                        "Cancel".to_string(), egui::FontId::proportional(font_size),
                         egui::Color32::PLACEHOLDER, f32::INFINITY,
                     )));
                     let save_w = g_save.rect.width() + 16.0;
@@ -1126,7 +1182,7 @@ impl eframe::App for SeWriterApp {
                     ui.horizontal(|ui| {
                         ui.add_space(offset);
 
-                        let (br_save, resp_save) = ui.allocate_exact_size(egui::vec2(save_w, LINE_HEIGHT), egui::Sense::click());
+                        let (br_save, resp_save) = ui.allocate_exact_size(egui::vec2(save_w, line_height), egui::Sense::click());
                         let vis_save = ui.style().interact(&resp_save);
                         ui.painter().rect(br_save, vis_save.rounding, vis_save.bg_fill, vis_save.bg_stroke);
                         ui.painter().galley(egui::pos2(br_save.left() + 8.0, br_save.top() + shift_y), g_save, vis_save.fg_stroke.color);
@@ -1138,7 +1194,7 @@ impl eframe::App for SeWriterApp {
 
                         ui.add_space(btn_gap);
 
-                        let (br_cancel, resp_cancel) = ui.allocate_exact_size(egui::vec2(cancel_w, LINE_HEIGHT), egui::Sense::click());
+                        let (br_cancel, resp_cancel) = ui.allocate_exact_size(egui::vec2(cancel_w, line_height), egui::Sense::click());
                         let vis_cancel = ui.style().interact(&resp_cancel);
                         ui.painter().rect(br_cancel, vis_cancel.rounding, vis_cancel.bg_fill, vis_cancel.bg_stroke);
                         ui.painter().galley(egui::pos2(br_cancel.left() + 8.0, br_cancel.top() + shift_y), g_cancel, vis_cancel.fg_stroke.color);
@@ -1205,7 +1261,7 @@ fn main() -> Result<(), eframe::Error> {
             }
 
             cc.egui_ctx.style_mut(|style| {
-                style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(FONT_SIZE));
+                style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
                 style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
                 // Hide egui's built-in cursor; SeWriter draws its own at the correct height.
                 // blink=false prevents egui from scheduling repaints for the invisible cursor.
