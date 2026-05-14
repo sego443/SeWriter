@@ -7,6 +7,17 @@
     <description>SeWriter app updates</description>
     <language>en</language>
     <item>
+      <title>Version 0.1.3</title>
+      <sparkle:version>3</sparkle:version>
+      <sparkle:shortVersionString>0.1.3</sparkle:shortVersionString>
+      <pubDate>Thu, 14 May 2026 03:09:20 +0000</pubDate>
+      <enclosure
+        url="https://github.com/sego443/SeWriter/releases/download/v0.1.3/SeWriter.dmg"
+        sparkle:edSignature="sCyotw1zXfJOceJ3gRVBmFr4p/pA1xz/RP1j/P5/n1vrA2/FTMS3KCQCQ5ZTFpKW4LmmW/QutSJtLpvdl82OBQ=="
+        length="9700205"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 0.1.2</title>
       <sparkle:version>2</sparkle:version>
       <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
