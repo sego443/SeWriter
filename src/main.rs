@@ -7,6 +7,31 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static HOTKEY_FIRED: AtomicBool = AtomicBool::new(false);
+const MAX_UNDO_RECORDS: usize = 100;
+const MAX_UNDO_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(all(target_os = "macos", sparkle_updater))]
+mod updater {
+    unsafe extern "C" {
+        fn sew_updater_start();
+        fn sew_check_for_updates();
+    }
+
+    pub fn start() {
+        unsafe { sew_updater_start() };
+    }
+
+    pub fn check_for_updates() {
+        unsafe { sew_check_for_updates() };
+    }
+}
+
+#[cfg(not(all(target_os = "macos", sparkle_updater)))]
+mod updater {
+    pub fn start() {}
+
+    pub fn check_for_updates() {}
+}
 
 fn default_font_size() -> f32 { 16.0 }
 
@@ -22,6 +47,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/new",    "save current and start a new file"),
     ("/re",     "open a previous file from vault"),
     ("/title",  "rename the current title"),
+    #[cfg(all(target_os = "macos", sparkle_updater))]
+    ("/update", "check for app updates"),
     ("/vault",  "manage vault"),
 ];
 
@@ -61,6 +88,246 @@ struct SeWriterApp {
     command_panel_needs_scroll: bool, // scroll to selected on next frame
     cursor_visible: bool,             // current blink state (true = shown)
     cursor_blink_start: f64,          // time of last toggle; drives next repaint schedule
+    editor_history: EditorHistory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    Insert,
+    Delete,
+    Replace,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EditRecord {
+    before_content: String,
+    after_content: String,
+    before_cursor: usize,
+    after_cursor: usize,
+    edit_kind: EditKind,
+    timestamp: f64,
+}
+
+impl EditRecord {
+    fn byte_len(&self) -> usize {
+        self.before_content.len() + self.after_content.len()
+    }
+}
+
+#[derive(Default)]
+struct EditorHistory {
+    undo_stack: Vec<EditRecord>,
+    redo_stack: Vec<EditRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryAction {
+    Undo,
+    Redo,
+}
+
+impl EditorHistory {
+    fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    fn push_edit(&mut self, record: EditRecord) {
+        if record.before_content == record.after_content {
+            return;
+        }
+        if let Some(last) = self.undo_stack.last_mut() {
+            if can_merge_insert(last, &record) {
+                last.after_content = record.after_content;
+                last.after_cursor = record.after_cursor;
+                last.timestamp = record.timestamp;
+                self.redo_stack.clear();
+                self.trim_to_limits();
+                return;
+            }
+        }
+        self.undo_stack.push(record);
+        self.redo_stack.clear();
+        self.trim_to_limits();
+    }
+
+    fn undo(&mut self) -> Option<(String, usize)> {
+        let record = self.undo_stack.pop()?;
+        let content = record.before_content.clone();
+        let cursor = record.before_cursor;
+        self.redo_stack.push(record);
+        Some((content, cursor))
+    }
+
+    fn redo(&mut self) -> Option<(String, usize)> {
+        let record = self.redo_stack.pop()?;
+        let content = record.after_content.clone();
+        let cursor = record.after_cursor;
+        self.undo_stack.push(record);
+        Some((content, cursor))
+    }
+
+    fn record_count(&self) -> usize {
+        self.undo_stack.len() + self.redo_stack.len()
+    }
+
+    fn byte_len(&self) -> usize {
+        self.undo_stack
+            .iter()
+            .chain(self.redo_stack.iter())
+            .map(EditRecord::byte_len)
+            .sum()
+    }
+
+    fn trim_to_limits(&mut self) {
+        while self.record_count() > MAX_UNDO_RECORDS {
+            self.remove_oldest_record();
+        }
+        while self.record_count() > 1 && self.byte_len() > MAX_UNDO_BYTES {
+            self.remove_oldest_record();
+        }
+    }
+
+    fn remove_oldest_record(&mut self) {
+        if !self.undo_stack.is_empty() {
+            self.undo_stack.remove(0);
+        } else if !self.redo_stack.is_empty() {
+            self.redo_stack.remove(0);
+        }
+    }
+}
+
+fn history_action_from_event(event: &egui::Event) -> Option<HistoryAction> {
+    match event {
+        egui::Event::Key {
+            key: egui::Key::Z,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command && !modifiers.shift => Some(HistoryAction::Undo),
+        egui::Event::Key {
+            key: egui::Key::Y,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command => Some(HistoryAction::Redo),
+        egui::Event::Key {
+            key: egui::Key::Z,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command && modifiers.shift => Some(HistoryAction::Redo),
+        _ => None,
+    }
+}
+
+fn edit_record_from_change(
+    before_content: &str,
+    after_content: &str,
+    before_cursor: usize,
+    after_cursor: usize,
+    before_had_selection: bool,
+    timestamp: f64,
+) -> Option<EditRecord> {
+    let edit_kind = classify_edit(before_content, after_content)?;
+    let record = EditRecord {
+        before_content: before_content.to_owned(),
+        after_content: after_content.to_owned(),
+        before_cursor,
+        after_cursor,
+        edit_kind: if before_had_selection && edit_kind == EditKind::Insert {
+            EditKind::Replace
+        } else {
+            edit_kind
+        },
+        timestamp,
+    };
+    Some(record)
+}
+
+fn classify_edit(before_content: &str, after_content: &str) -> Option<EditKind> {
+    if before_content == after_content {
+        return None;
+    }
+
+    let before_chars = before_content.chars().collect::<Vec<_>>();
+    let after_chars = after_content.chars().collect::<Vec<_>>();
+
+    let mut prefix_len = 0;
+    while prefix_len < before_chars.len()
+        && prefix_len < after_chars.len()
+        && before_chars[prefix_len] == after_chars[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0;
+    while suffix_len < before_chars.len() - prefix_len
+        && suffix_len < after_chars.len() - prefix_len
+        && before_chars[before_chars.len() - 1 - suffix_len]
+            == after_chars[after_chars.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    match (
+        before_chars.len() - prefix_len - suffix_len,
+        after_chars.len() - prefix_len - suffix_len,
+    ) {
+        (0, inserted) if inserted > 0 => Some(EditKind::Insert),
+        (removed, 0) if removed > 0 => Some(EditKind::Delete),
+        _ => Some(EditKind::Replace),
+    }
+}
+
+fn can_merge_insert(previous: &EditRecord, next: &EditRecord) -> bool {
+    previous.edit_kind == EditKind::Insert
+        && next.edit_kind == EditKind::Insert
+        && previous.after_content == next.before_content
+        && previous.after_cursor == next.before_cursor
+        && next.after_cursor == next.before_cursor + 1
+        && inserted_text(&previous.before_content, &previous.after_content)
+            .is_some_and(|text| text != "\n")
+        && inserted_text(&next.before_content, &next.after_content)
+            .is_some_and(|text| text != "\n")
+}
+
+fn inserted_text(before_content: &str, after_content: &str) -> Option<String> {
+    let before_chars = before_content.chars().collect::<Vec<_>>();
+    let after_chars = after_content.chars().collect::<Vec<_>>();
+    if after_chars.len() <= before_chars.len() {
+        return None;
+    }
+
+    let mut prefix_len = 0;
+    while prefix_len < before_chars.len()
+        && prefix_len < after_chars.len()
+        && before_chars[prefix_len] == after_chars[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0;
+    while suffix_len < before_chars.len() - prefix_len
+        && suffix_len < after_chars.len() - prefix_len
+        && before_chars[before_chars.len() - 1 - suffix_len]
+            == after_chars[after_chars.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    if before_chars.len() != prefix_len + suffix_len {
+        return None;
+    }
+    Some(
+        after_chars[prefix_len..after_chars.len() - suffix_len]
+            .iter()
+            .collect(),
+    )
+}
+
+fn clamped_cursor_index(cursor_index: usize, content: &str) -> usize {
+    cursor_index.min(content.chars().count())
 }
 
 #[derive(PartialEq)]
@@ -123,6 +390,7 @@ impl SeWriterApp {
             command_panel_needs_scroll: false,
             cursor_visible: true,
             cursor_blink_start: 0.0,
+            editor_history: EditorHistory::default(),
         }
     }
 
@@ -204,6 +472,7 @@ impl SeWriterApp {
             if tmp_path.exists() {
                 if let Ok(content) = fs::read_to_string(tmp_path) {
                     self.state.current_content = content;
+                    self.editor_history.clear();
                 }
             }
         }
@@ -243,6 +512,7 @@ impl SeWriterApp {
 
             if (is_new_day || is_empty) && self.input_mode != InputMode::SelectVault {
                 self.state.current_content = String::new();
+                self.editor_history.clear();
                 self.input_mode = InputMode::InputTitle;
             }
 
@@ -358,6 +628,7 @@ impl eframe::App for SeWriterApp {
                                 fs::write(&guidebook, "Welcome to SeWriter!\n\nThis is your guidebook.").ok();
                                 self.state.current_title = "Guidebook".to_string();
                                 self.state.current_content = fs::read_to_string(&guidebook).unwrap_or_default();
+                                self.editor_history.clear();
                                 self.state.last_edit_date = Some(Local::now().format("%Y-%m-%d").to_string());
                                 self.input_mode = InputMode::EditContent;
                                 self.save_state();
@@ -462,6 +733,7 @@ impl eframe::App for SeWriterApp {
                         self.state.last_edit_date = Some(Local::now().format("%Y-%m-%d").to_string());
                         self.state.current_content = String::new();
                         self.load_tmp_file();
+                        self.editor_history.clear();
                         self.input_mode = InputMode::EditContent;
                         self.request_focus = true;
                         self.save_state();
@@ -570,6 +842,35 @@ impl eframe::App for SeWriterApp {
                     }
                 }
                 InputMode::EditContent => {
+                    let mut restore_content_cursor = None;
+                    let history_action_requested = if self.show_save_dialog {
+                        None
+                    } else {
+                        ctx.input_mut(|i| {
+                            let Some(pos) = i
+                                .events
+                                .iter()
+                                .position(|e| history_action_from_event(e).is_some())
+                            else {
+                                return None;
+                            };
+                            let action = history_action_from_event(&i.events[pos]);
+                            i.events.remove(pos);
+                            action
+                        })
+                    };
+                    if let Some(action) = history_action_requested {
+                        let result = match action {
+                            HistoryAction::Undo => self.editor_history.undo(),
+                            HistoryAction::Redo => self.editor_history.redo(),
+                        };
+                        if let Some((content, cursor_index)) = result {
+                            self.state.current_content = content;
+                            restore_content_cursor = Some(cursor_index);
+                            self.auto_save();
+                        }
+                    }
+
                     // IME backspace fix: on macOS Pinyin, pressing backspace when only
                     // one preedit char remains sends Ime(Disabled) instead of Preedit("").
                     // TextEdit's Disabled handler only sets ime_enabled=false — it never
@@ -602,7 +903,19 @@ impl eframe::App for SeWriterApp {
                                 ui.disable();
                             }
 
-                            let te_out = egui::TextEdit::multiline(&mut self.state.current_content)
+                            let content_editor_id = ui.make_persistent_id("content-editor");
+                            let content_before = self.state.current_content.clone();
+                            let cursor_before_range =
+                                egui::TextEdit::load_state(ui.ctx(), content_editor_id)
+                                    .and_then(|state| state.cursor.char_range());
+                            let cursor_before = cursor_before_range
+                                .map(|range| range.primary.index)
+                                .unwrap_or(0);
+                            let before_had_selection = cursor_before_range
+                                .is_some_and(|range| range.primary.index != range.secondary.index);
+
+                            let mut te_out = egui::TextEdit::multiline(&mut self.state.current_content)
+                                .id(content_editor_id)
                                 .desired_width(f32::INFINITY)
                                 .layouter(&mut |ui, text, wrap_width| {
                                     let mut job = egui::text::LayoutJob::simple(
@@ -617,6 +930,55 @@ impl eframe::App for SeWriterApp {
                                     ui.fonts(|f| f.layout_job(job))
                                 })
                                 .show(ui);
+
+                            if restore_content_cursor.is_none()
+                                && te_out.response.changed()
+                                && content_before != self.state.current_content
+                            {
+                                let cursor_after = te_out
+                                    .state
+                                    .cursor
+                                    .char_range()
+                                    .map(|range| range.primary.index)
+                                    .unwrap_or(cursor_before);
+                                if let Some(record) = edit_record_from_change(
+                                    &content_before,
+                                    &self.state.current_content,
+                                    cursor_before,
+                                    cursor_after,
+                                    before_had_selection,
+                                    ui.input(|i| i.time),
+                                ) {
+                                    self.editor_history.push_edit(record);
+                                }
+                            }
+
+                            te_out.state.clear_undoer();
+                            if let Some(cursor_index) = restore_content_cursor {
+                                let cursor = egui::text::CCursor::new(clamped_cursor_index(
+                                    cursor_index,
+                                    &self.state.current_content,
+                                ));
+                                te_out.state.cursor.set_char_range(Some(
+                                    egui::text::CCursorRange::one(cursor),
+                                ));
+                                te_out.state.clear_undoer();
+
+                                if let Some(cursor_range) = te_out.state.cursor.range(&te_out.galley) {
+                                    let row_rect = te_out.galley.pos_from_cursor(&cursor_range.primary);
+                                    let screen_pos = egui::pos2(
+                                        te_out.galley_pos.x + row_rect.min.x,
+                                        te_out.galley_pos.y + row_rect.center().y,
+                                    );
+                                    let cursor_rect = egui::Rect::from_center_size(
+                                        screen_pos,
+                                        egui::vec2(1.0, cursor_height),
+                                    );
+                                    ui.scroll_to_rect(cursor_rect, Some(egui::Align::Center));
+                                    te_out.cursor_range = Some(cursor_range);
+                                }
+                            }
+                            te_out.state.clone().store(ui.ctx(), content_editor_id);
 
                             // Center text within each line_height row.
                             //
@@ -902,6 +1264,7 @@ impl eframe::App for SeWriterApp {
                                         self.save_final();
                                         self.state.current_title = String::new();
                                         self.state.current_content = String::new();
+                                        self.editor_history.clear();
                                         self.input_mode = InputMode::InputTitle;
                                         self.request_focus = true;
                                     }
@@ -909,12 +1272,19 @@ impl eframe::App for SeWriterApp {
                                         self.save_final();
                                         self.state.current_title = String::new();
                                         self.state.current_content = String::new();
+                                        self.editor_history.clear();
                                         self.input_mode = InputMode::InputTitle;
                                         self.hide(ctx);
                                     }
                                     (None, "/title") => {
                                         self.rename_old_title = self.state.current_title.clone();
                                         self.input_mode = InputMode::RenameTitle;
+                                        self.request_focus = true;
+                                    }
+                                    (None, "/update") => {
+                                        updater::check_for_updates();
+                                        self.command_parent = None;
+                                        self.input_mode = InputMode::EditContent;
                                         self.request_focus = true;
                                     }
                                     (None, "/vault") => {
@@ -940,6 +1310,7 @@ impl eframe::App for SeWriterApp {
                                     (Some("/vault"), "new") => {
                                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                             self.state.vault_path = Some(path);
+                                            self.editor_history.clear();
                                             self.save_state();
                                         }
                                         self.command_parent = None;
@@ -957,6 +1328,7 @@ impl eframe::App for SeWriterApp {
                                                 }
                                             }
                                             self.state.vault_path = Some(new_path);
+                                            self.editor_history.clear();
                                             self.save_state();
                                         }
                                         self.command_parent = None;
@@ -981,6 +1353,7 @@ impl eframe::App for SeWriterApp {
                                             self.state.current_content = content;
                                             self.state.current_title = self.command_re_selected_title.clone();
                                             self.state.last_edit_date = Some(Local::now().format("%Y-%m-%d").to_string());
+                                            self.editor_history.clear();
                                             self.save_state();
                                         }
                                         self.command_parent = None;
@@ -1302,7 +1675,224 @@ fn main() -> Result<(), eframe::Error> {
                 })
                 .expect("failed to spawn hotkey-watcher");
 
+            updater::start();
+
             Ok(Box::new(SeWriterApp::new()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(
+        before_content: &str,
+        after_content: &str,
+        before_cursor: usize,
+        after_cursor: usize,
+        before_had_selection: bool,
+    ) -> EditRecord {
+        edit_record_from_change(
+            before_content,
+            after_content,
+            before_cursor,
+            after_cursor,
+            before_had_selection,
+            1.0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn editor_history_restores_multiple_deletes_lifo() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("abc", "ab", 3, 2, false));
+        history.push_edit(record("ab", "a", 2, 1, false));
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "ab");
+        assert_eq!(cursor, 2);
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "abc");
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn editor_history_undoes_intervening_insert_before_prior_delete() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("ABC", "AB", 3, 2, false));
+        history.push_edit(record("AB", "AB\nABC", 2, 6, false));
+        history.push_edit(record("AB\nABC", "AB\nAB", 6, 5, false));
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "AB\nABC");
+        assert_eq!(cursor, 6);
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "AB");
+        assert_eq!(cursor, 2);
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "ABC");
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn editor_history_redoes_after_undo() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("ABC", "AB", 3, 2, false));
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "ABC");
+        assert_eq!(cursor, 3);
+
+        let (content, cursor) = history.redo().unwrap();
+        assert_eq!(content, "AB");
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn editor_history_clears_redo_after_new_edit() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("A", "AB", 1, 2, false));
+        assert_eq!(history.undo().unwrap().0, "A");
+
+        history.push_edit(record("A", "AC", 1, 2, false));
+
+        assert!(history.redo().is_none());
+        assert_eq!(history.undo().unwrap().0, "A");
+    }
+
+    #[test]
+    fn editor_history_restores_primary_cursor_for_selection_delete() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("ABC", "A", 3, 1, true));
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "ABC");
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn editor_history_keeps_paste_and_replace_as_single_steps() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("A", "Axyz", 1, 4, false));
+        history.push_edit(record("Axyz", "A!", 4, 2, true));
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "Axyz");
+        assert_eq!(cursor, 4);
+
+        let (content, cursor) = history.undo().unwrap();
+        assert_eq!(content, "A");
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn editor_history_merges_adjacent_plain_insertions() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("", "A", 0, 1, false));
+        history.push_edit(record("A", "AB", 1, 2, false));
+
+        assert_eq!(history.undo_stack.len(), 1);
+        assert_eq!(history.undo().unwrap().0, "");
+    }
+
+    #[test]
+    fn editor_history_does_not_merge_newline_insertions() {
+        let mut history = EditorHistory::default();
+        history.push_edit(record("A", "A\n", 1, 2, false));
+        history.push_edit(record("A\n", "A\nB", 2, 3, false));
+
+        assert_eq!(history.undo_stack.len(), 2);
+    }
+
+    #[test]
+    fn editor_history_trims_oldest_records_past_record_limit() {
+        let mut history = EditorHistory::default();
+
+        for i in 0..=MAX_UNDO_RECORDS {
+            let before = format!("{}x", i);
+            let after = i.to_string();
+            history.push_edit(record(
+                &before,
+                &after,
+                before.chars().count(),
+                after.chars().count(),
+                false,
+            ));
+        }
+
+        assert_eq!(history.record_count(), MAX_UNDO_RECORDS);
+        assert_eq!(history.undo_stack.first().unwrap().before_content, "1x");
+    }
+
+    #[test]
+    fn editor_history_trims_oldest_records_past_byte_limit() {
+        let mut history = EditorHistory::default();
+        let large = "x".repeat(MAX_UNDO_BYTES + 1);
+        history.push_edit(record(&large, "", large.chars().count(), 0, false));
+        history.push_edit(record("ab", "a", 2, 1, false));
+
+        assert_eq!(history.record_count(), 1);
+        assert_eq!(history.undo_stack.first().unwrap().before_content, "ab");
+        assert!(history.byte_len() <= MAX_UNDO_BYTES);
+    }
+
+    #[test]
+    fn restored_cursor_index_is_clamped_to_current_content() {
+        assert_eq!(clamped_cursor_index(10, "abc"), 3);
+        assert_eq!(clamped_cursor_index(2, "a好c"), 2);
+    }
+
+    #[test]
+    fn history_shortcuts_map_to_expected_actions() {
+        let undo_event = egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            history_action_from_event(&undo_event),
+            Some(HistoryAction::Undo)
+        );
+
+        let redo_y_event = egui::Event::Key {
+            key: egui::Key::Y,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            history_action_from_event(&redo_y_event),
+            Some(HistoryAction::Redo)
+        );
+
+        let redo_shift_z_event = egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                shift: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            history_action_from_event(&redo_shift_z_event),
+            Some(HistoryAction::Redo)
+        );
+    }
 }

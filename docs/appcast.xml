@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"
+     xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>SeWriter Updates</title>
+    <link>https://github.com/sego443/SeWriter</link>
+    <description>SeWriter app updates</description>
+    <language>en</language>
+    <item>
+      <title>Version 0.1.2</title>
+      <sparkle:version>2</sparkle:version>
+      <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
+      <pubDate>Thu, 14 May 2026 02:47:34 +0000</pubDate>
+      <enclosure
+        url="https://github.com/sego443/SeWriter/releases/download/v0.1.2/SeWriter.dmg"
+        sparkle:edSignature="ZO73RyFO03er7xVHl0mP7PW2p8FwBsSOQOH0M/ZJtoUku3SSlcD9kK6MKmhgEP5kpXXyPQBvImTqW2g6o5b1BQ=="
+        length="9700677"
+        type="application/octet-stream" />
+    </item>
+  </channel>
+</rss>

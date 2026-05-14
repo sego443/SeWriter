@@ -10,7 +10,7 @@ Open - Write - Close. That's it.
 
 ## Download
 
-**[→ Download SeWriter for Mac](https://github.com/sego443/SeWriter/releases/tag/v0.1.0)** (macOS 12+, Apple Silicon & Intel)
+**[→ Download SeWriter for Mac](https://github.com/sego443/SeWriter/releases/tag/v0.1.2)** (macOS 12+, Apple Silicon & Intel)
 
 ---
 
@@ -43,6 +43,12 @@ Press **Cmd+/** while writing to open the command panel. Type to filter, arrow k
 | `/vault new` | Choose a new folder as your vault |
 | `/vault reset` | Relocate to a different vault |
 | `/config` | Adjust settings (font size, etc.) |
+
+Future app updates will use Sparkle with this appcast feed:
+
+```text
+https://sego443.github.io/SeWriter/appcast.xml
+```
 
 ---
 
